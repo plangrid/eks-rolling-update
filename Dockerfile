@@ -1,5 +1,5 @@
 FROM python:3-alpine3.10 as builder
-ARG VERSION
+ENV VERSION 1.0
 RUN apk add --no-cache curl make && \
     curl -LO  https://amazon-eks.s3-us-west-2.amazonaws.com/1.14.6/2019-08-22/bin/linux/amd64/aws-iam-authenticator && \
     chmod +x aws-iam-authenticator && \
