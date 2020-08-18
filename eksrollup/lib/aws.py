@@ -1,8 +1,9 @@
 import boto3
 import time
+import datetime
 import requests
-from lib.logger import logger
-from config import app_config
+from .logger import logger
+from eksrollup.config import app_config
 
 client = boto3.client('autoscaling')
 ec2_client = boto3.client('ec2')
@@ -32,25 +33,26 @@ def get_launch_template(lt_name):
     return response['LaunchTemplates'][0]
 
 
-def terminate_instance(instance_id):
+def terminate_instance_in_asg(instance_id):
     """
     Terminates EC2 instance given an instance ID
     """
-    logger.info('Terminating ec2 instance {}...'.format(instance_id))
-    try:
-        response = ec2_client.terminate_instances(
-            InstanceIds=[instance_id],
-            DryRun=app_config['DRY_RUN']
-        )
-        if response['ResponseMetadata']['HTTPStatusCode'] == requests.codes.ok:
-            logger.info('Termination of instance succeeded.')
-        else:
-            logger.info('Termination of instance failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
-            raise Exception('Termination of instance failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
+    if not app_config['DRY_RUN']:
+        logger.info('Terminating ec2 instance in ASG {}...'.format(instance_id))
+        try:
+            response = client.terminate_instance_in_auto_scaling_group(
+                InstanceId=instance_id,
+                ShouldDecrementDesiredCapacity=True
+            )
+            if response['ResponseMetadata']['HTTPStatusCode'] == requests.codes.ok:
+                logger.info('Termination signal for instance is successfully sent.')
+            else:
+                logger.info('Termination signal for instance has failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
+                raise Exception('Termination of instance failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
 
-    except client.exceptions.ClientError as e:
-        if 'DryRunOperation' not in str(e):
-            raise
+        except client.exceptions.ClientError as e:
+            if 'DryRunOperation' not in str(e):
+                raise
 
 
 def is_asg_healthy(asg_name, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
@@ -58,6 +60,7 @@ def is_asg_healthy(asg_name, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_
     Checks that all instances in an ASG have a HealthStatus of healthy. Returns False if not
     """
     retry_count = 1
+    asg_healthy = False
     while retry_count < max_retry:
         asg_healthy = True
         retry_count += 1
@@ -85,7 +88,6 @@ def is_asg_scaled(asg_name, desired_capacity):
     """
     Checks that the number of EC2 instances in an ASG matches desired capacity
     """
-    is_scaled = False
     logger.info('Checking asg {} instance count...'.format(asg_name))
     response = client.describe_auto_scaling_groups(
         AutoScalingGroupNames=[asg_name], MaxRecords=1
@@ -116,7 +118,7 @@ def modify_aws_autoscaling(asg_name, action):
         asg_name,
         action)
     )
-    if app_config['DRY_RUN'] is not True:
+    if not app_config['DRY_RUN']:
 
         if action == "suspend":
             response = client.suspend_processes(
@@ -145,7 +147,7 @@ def scale_asg(asg_name, current_desired_capacity, new_desired_capacity, new_max_
     Changes the desired capacity of an asg
     """
     logger.info('Setting asg desired capacity from {} to {} and max size to {}...'.format(current_desired_capacity, new_desired_capacity, new_max_size))
-    if app_config['DRY_RUN'] is not True:
+    if not app_config['DRY_RUN']:
         response = client.update_auto_scaling_group(
             AutoScalingGroupName=asg_name,
             DesiredCapacity=new_desired_capacity,
@@ -155,7 +157,6 @@ def scale_asg(asg_name, current_desired_capacity, new_desired_capacity, new_max_
             raise Exception('AWS scale up operation did not succeed. Exiting.')
     else:
         logger.info('Skipping asg scaling due to dry run flag set')
-        response = {'message': 'dry run only'}
 
 
 def save_asg_tags(asg_name, key, value):
@@ -163,7 +164,7 @@ def save_asg_tags(asg_name, key, value):
     Adds a tag to asg for later retrieval
     """
     logger.info('Saving tag to asg key: {}, value : {}...'.format(key, value))
-    if app_config['DRY_RUN'] is not True:
+    if not app_config['DRY_RUN']:
         response = client.create_or_update_tags(
             Tags=[
                 {
@@ -189,7 +190,7 @@ def delete_asg_tags(asg_name, key):
     Deletes a tag from asg
     """
     logger.info('Deleting tag from asg key: {}...'.format(key))
-    if app_config['DRY_RUN'] is not True:
+    if not app_config['DRY_RUN']:
         response = client.delete_tags(
             Tags=[
                 {
@@ -257,13 +258,43 @@ def instance_outdated_launchtemplate(instance_obj, asg_lt_name, asg_lt_version):
     return False
 
 
+def instance_outdated_age(instance_id, days_fresh):
+    """
+    Checks the age of an instance against the MAX_ALLOWABLE_NODE_AGE.
+    """
+
+    response = ec2_client.describe_instances(
+        InstanceIds=[
+            instance_id,
+        ]
+    )
+
+    instance_launch_time = response['Reservations'][0]['Instances'][0]['LaunchTime']
+
+    # gets the age of a node by days only:
+    instance_age = ((datetime.datetime.now(instance_launch_time.tzinfo) - instance_launch_time).days)
+
+    # gets the remaining age of a node in seconds (e.g. if node is y days and x seconds old this will only retrieve the x seconds):
+    instance_age_remainder = ((datetime.datetime.now(instance_launch_time.tzinfo) - instance_launch_time).seconds)
+
+    if instance_age > days_fresh:
+        logger.info("Instance id {} launch age of '{}' day(s) is older than expected '{}' day(s)".format(instance_id, instance_age, days_fresh))
+        return True
+    elif (instance_age == days_fresh) and (instance_age_remainder > 0):
+        logger.info("Instance id {} is older than expected '{}' day(s) by {} seconds.".format(instance_id, days_fresh, instance_age_remainder))
+        return True
+    else:
+        logger.info("Instance id {} : OK ".format(instance_id))
+        return False
+
+
 def instance_terminated(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
     """
     Checks that an ec2 instance is terminated or stopped given an InstanceID
     """
     retry_count = 1
+    is_instance_terminated = False
     while retry_count < max_retry:
-        is_instance_terminated = True
         logger.info('Checking instance {} is terminated...'.format(instance_id))
         retry_count += 1
         response = ec2_client.describe_instances(
@@ -275,7 +306,7 @@ def instance_terminated(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], w
             is_instance_terminated = False
             logger.info('Instance {} is still running, checking again...'.format(instance_id))
         else:
-            logger.info('Instance {} terminiated!'.format(instance_id))
+            logger.info('Instance {} terminated!'.format(instance_id))
             is_instance_terminated = True
             break
         time.sleep(wait)
@@ -286,10 +317,14 @@ def plan_asgs(asgs):
     """
     Checks to see which asgs are out of date
     """
+    asg_outdated_instance_dict = {}
     for asg in asgs:
-        logger.info('*** Checking autoscaling group {} ***'.format(asg['AutoScalingGroupName']))
         asg_name = asg['AutoScalingGroupName']
+        logger.info('*** Checking autoscaling group {} ***'.format(asg_name))
         launch_type = ""
+        asg_lc_name = ""
+        asg_lt_name = ""
+        asg_lt_version = ""
         if 'LaunchConfigurationName' in asg:
             launch_type = "LaunchConfiguration"
             asg_lc_name = asg['LaunchConfigurationName']
@@ -304,7 +339,7 @@ def plan_asgs(asgs):
             asg_lt_version = asg['MixedInstancesPolicy']['LaunchTemplate']['LaunchTemplateSpecification'][
                 'Version']
         else:
-            logger.error(f"Auto Scaling Group {asg_name} doesn't have LaunchConfigurationName or MixedInstancesPolicy")
+            logger.error(f"Auto Scaling Group {asg_name} doesn't have LaunchConfigurationName or LaunchTemplate")
 
         instances = asg['Instances']
         # return a list of outdated instances
@@ -319,6 +354,34 @@ def plan_asgs(asgs):
         logger.info('Found {} outdated instances'.format(
             len(outdated_instances))
         )
+        asg_outdated_instance_dict[asg_name] = outdated_instances, asg
+
+    return asg_outdated_instance_dict
+
+
+def plan_asgs_older_nodes(asgs):
+    """
+    Checks to see which asgs are out of date
+    """
+    days_fresh = app_config['MAX_ALLOWABLE_NODE_AGE']
+
+    asg_outdated_instance_dict = {}
+    for asg in asgs:
+        asg_name = asg['AutoScalingGroupName']
+        logger.info('*** Checking for nodes older than {} days in autoscaling group {} ***'.format(days_fresh, asg_name))
+
+        instances = asg['Instances']
+        # return a list of outdated instances
+        outdated_instances = []
+        for instance in instances:
+            if instance_outdated_age(instance['InstanceId'], days_fresh):
+                outdated_instances.append(instance)
+        logger.info('Found {} outdated instances'.format(
+            len(outdated_instances))
+        )
+        asg_outdated_instance_dict[asg_name] = outdated_instances, asg
+
+    return asg_outdated_instance_dict
 
 
 def get_asg_tag(tags, tag_name):
@@ -333,58 +396,16 @@ def get_asg_tag(tags, tag_name):
     return result
 
 
-def count_all_cluster_instances(cluster_name):
+def count_all_cluster_instances(cluster_name, predictive=False):
     """
     Returns the total number of ec2 instances in a k8s cluster
     """
     count = 0
     asgs = get_asgs(cluster_name)
     for asg in asgs:
-        count += len(asg['Instances'])
-    logger.info("Current asg instance count in cluster is: {}. K8s node count should match this number".format(count))
+        if predictive:
+            count += asg['DesiredCapacity']
+        else:
+            count += len(asg['Instances'])
+    logger.info("{} asg instance count in cluster is: {}. K8s node count should match this number".format("*** Predicted" if predictive else "Current", count))
     return count
-
-
-def detach_instance(instance_id, asg_name):
-    """
-    Detach EC2 instance from ASG given an instance ID and an ASG name
-    """
-    logger.info('Detaching ec2 instance {} from asg {}...'.format(instance_id, asg_name))
-    try:
-        response = client.detach_instances(
-            InstanceIds=[instance_id],
-            AutoScalingGroupName=asg_name,
-            ShouldDecrementDesiredCapacity=True
-        )
-        if response['ResponseMetadata']['HTTPStatusCode'] == requests.codes.ok:
-            logger.info('Instance detachement from ASG succeeded.')
-        else:
-            logger.info('Instance detachement from ASG failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
-            raise Exception('Instance detachement from ASG failed. Response code was {}. Exiting.'.format(response['ResponseMetadata']['HTTPStatusCode']))
-
-    except client.exceptions.ClientError as e:
-        if 'DryRunOperation' not in str(e):
-            raise
-
-
-def instance_detached(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
-    """
-    Checks that an ec2 instance is detached from any asg given an InstanceID
-    """
-    retry_count = 1
-    while retry_count < max_retry:
-        is_instance_detached = True
-        logger.info('Checking instance {} is detached...'.format(instance_id))
-        retry_count += 1
-        response = client.describe_auto_scaling_instances(
-            InstanceIds=[instance_id], MaxRecords=1
-        )
-        if len(response['AutoScalingInstances']) != 0:
-            is_instance_detached = False
-            logger.info('Instance {} is still attached, checking again...'.format(instance_id))
-        else:
-            logger.info('Instance {} detached!'.format(instance_id))
-            is_instance_detached = True
-            break
-        time.sleep(wait)
-    return is_instance_detached

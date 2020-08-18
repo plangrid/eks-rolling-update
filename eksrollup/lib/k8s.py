@@ -3,18 +3,32 @@ from kubernetes.client.rest import ApiException
 import subprocess
 import time
 import sys
-from lib.logger import logger
-from config import app_config
+from .logger import logger
+from eksrollup.config import app_config
 
 
-def get_k8s_nodes():
+def get_k8s_nodes(exclude_node_label_key=app_config["EXCLUDE_NODE_LABEL_KEY"]):
     """
     Returns a list of kubernetes nodes
     """
-    config.load_kube_config()
+
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        try:
+            config.load_kube_config()
+        except config.ConfigException:
+            raise Exception("Could not configure kubernetes python client")
+
     k8s_api = client.CoreV1Api()
     logger.info("Getting k8s nodes...")
     response = k8s_api.list_node()
+    if exclude_node_label_key is not None:
+        nodes = []
+        for node in response.items:
+            if exclude_node_label_key not in node.metadata.labels:
+                nodes.append(node)
+        response.items = nodes
     logger.info("Current k8s node count is {}".format(len(response.items)))
     return response.items
 
@@ -28,7 +42,7 @@ def get_node_by_instance_id(k8s_nodes, instance_id):
     logger.info('Searching for k8s node name by instance id...')
     for k8s_node in k8s_nodes:
         if instance_id in k8s_node.spec.provider_id:
-            logger.info('InstanceId {} is node {} in kuberentes land'.format(instance_id, k8s_node.metadata.name))
+            logger.info('InstanceId {} is node {} in kubernetes land'.format(instance_id, k8s_node.metadata.name))
             node_name = k8s_node.metadata.name
     if not node_name:
         logger.info("Could not find a k8s node name for that instance id. Exiting")
@@ -40,19 +54,25 @@ def modify_k8s_autoscaler(action):
     """
     Pauses or resumes the Kubernetes autoscaler
     """
-    import kubernetes.client
-    config.load_kube_config()
-    k8s_api = client.CoreV1Api()
+
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        try:
+            config.load_kube_config()
+        except config.ConfigException:
+            raise Exception("Could not configure kubernetes python client")
+
     # Configure API key authorization: BearerToken
-    configuration = kubernetes.client.Configuration()
+    configuration = client.Configuration()
     # create an instance of the API class
-    k8s_api = kubernetes.client.AppsV1Api(kubernetes.client.ApiClient(configuration))
+    k8s_api = client.AppsV1Api(client.ApiClient(configuration))
     if action == 'pause':
         logger.info('Pausing k8s autoscaler...')
         body = {'spec': {'replicas': 0}}
     elif action == 'resume':
         logger.info('Resuming k8s autoscaler...')
-        body = {'spec': {'replicas': 2}}
+        body = {'spec': {'replicas': app_config['K8S_AUTOSCALER_REPLICAS']}}
     else:
         logger.info('Invalid k8s autoscaler option')
         sys.exit(1)
@@ -72,12 +92,18 @@ def delete_node(node_name):
     """
     Deletes a kubernetes node from the cluster
     """
-    import kubernetes.client
-    config.load_kube_config()
-    k8s_api = client.CoreV1Api()
-    configuration = kubernetes.client.Configuration()
+
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        try:
+            config.load_kube_config()
+        except config.ConfigException:
+            raise Exception("Could not configure kubernetes python client")
+
+    configuration = client.Configuration()
     # create an instance of the API class
-    k8s_api = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
+    k8s_api = client.CoreV1Api(client.ApiClient(configuration))
     logger.info("Deleting k8s node {}...".format(node_name))
     try:
         if not app_config['DRY_RUN']:
@@ -89,28 +115,53 @@ def delete_node(node_name):
         logger.info("Exception when calling CoreV1Api->delete_node: {}".format(e))
 
 
+def cordon_node(node_name):
+    """
+    Cordon a kubernetes node to avoid new pods being scheduled on it
+    """
+
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        try:
+            config.load_kube_config()
+        except config.ConfigException:
+            raise Exception("Could not configure kubernetes python client")
+
+    configuration = client.Configuration()
+    # create an instance of the API class
+    k8s_api = client.CoreV1Api(client.ApiClient(configuration))
+    logger.info("Cordoning k8s node {}...".format(node_name))
+    try:
+        api_call_body = client.V1Node(spec=client.V1NodeSpec(unschedulable=True))
+        if not app_config['DRY_RUN']:
+            k8s_api.patch_node(node_name, api_call_body)
+        else:
+            k8s_api.patch_node(node_name, api_call_body, dry_run=True)
+        logger.info("Node cordoned")
+    except ApiException as e:
+        logger.info("Exception when calling CoreV1Api->patch_node: {}".format(e))
+
+
 def drain_node(node_name):
     """
     Executes kubectl commands to drain the node. We are not using the api
     because the draining functionality is done client side and to
     replicate the same functionality here would be too time consuming
     """
-    logger.info('Draining worker node {}...'.format(node_name))
+    kubectl_args = [
+        'kubectl', 'drain', node_name,
+        '--ignore-daemonsets',
+        '--delete-local-data'
+    ]
+    kubectl_args += app_config['EXTRA_DRAIN_ARGS']
+
     if app_config['DRY_RUN'] is True:
-        result = subprocess.run([
-            'kubectl', 'drain', node_name,
-            '--ignore-daemonsets',
-            '--delete-local-data',
-            '--dry-run'
-        ]
-        )
-    else:
-        result = subprocess.run([
-            'kubectl', 'drain', node_name,
-            '--ignore-daemonsets',
-            '--delete-local-data'
-        ]
-        )
+        kubectl_args += ['--dry-run']
+
+    logger.info('Draining worker node with {}...'.format(' '.join(kubectl_args)))
+    result = subprocess.run(kubectl_args)
+
     # If returncode is non-zero, raise a CalledProcessError.
     if result.returncode != 0:
         raise Exception("Node not drained properly. Exiting")
@@ -122,6 +173,7 @@ def k8s_nodes_ready(max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['G
     """
     logger.info('Checking k8s nodes health status...')
     retry_count = 1
+    healthy_nodes = False
     while retry_count < max_retry:
         # reset healthy nodes after every loop
         healthy_nodes = True
@@ -153,6 +205,7 @@ def k8s_nodes_count(desired_node_count, max_retry=app_config['GLOBAL_MAX_RETRY']
     """
     logger.info('Checking k8s expected nodes are online after asg scaled up...')
     retry_count = 1
+    nodes_online = False
     while retry_count < max_retry:
         nodes_online = True
         retry_count += 1
